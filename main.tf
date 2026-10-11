@@ -1,3 +1,29 @@
+data "aws_ami" "ubuntu" {
+  count = var.ami_id == "" ? 1 : 0
+
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+
+  filter {
+    name   = "root-device-type"
+    values = ["ebs"]
+  }
+}
+
+locals {
+  resolved_ami_id = var.ami_id != "" ? var.ami_id : data.aws_ami.ubuntu[0].id
+}
+
 module "vpc" {
   source = "./modules/vpc"
 
@@ -32,7 +58,7 @@ module "ec2" {
 
   project_name          = var.project_name
   environment           = var.environment
-  ami_id                = var.ami_id
+  ami_id                = local.resolved_ami_id
   instance_type         = var.instance_type
   key_name              = var.key_name
   ec2_security_group_id = module.security_groups.ec2_security_group_id
@@ -52,7 +78,6 @@ module "autoscaling" {
   asg_desired_capacity    = var.asg_desired_capacity
   cpu_target_utilization  = var.cpu_target_utilization
 
-  # Wait for NAT Gateway to be ready before launching instances,
-  # otherwise the first instance boots without internet and user data fails.
+  # Wait for network resources before the first instances bootstrap.
   depends_on = [module.vpc]
 }
