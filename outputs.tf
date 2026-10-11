@@ -43,12 +43,3 @@ output "launch_template_id" {
   value       = module.ec2.launch_template_id
 }
 
-output "test_lb_cmd_curl" {
-  description = "Verify load balancing via curl (Git Bash / WSL / macOS)."
-  value       = "for i in $(seq 1 15); do curl -s http://${module.alb.alb_dns_name}/api/status | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d['private_ip'], d['instance_id'], d['az'])\"; done"
-}
-
-output "test_lb_cmd_powershell" {
-  description = "Verify load balancing via PowerShell."
-  value       = "1..15 | % { (Invoke-RestMethod http://${module.alb.alb_dns_name}/api/status) | Select-Object private_ip, instance_id, az }"
-}
