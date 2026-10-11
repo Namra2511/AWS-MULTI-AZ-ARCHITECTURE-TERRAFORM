@@ -9,9 +9,9 @@ terraform {
   }
 
   backend "s3" {
-    bucket       = "namra-terraform-state"
+    bucket       = "app-tf-state-file"
     key          = "production/terraform.tfstate"
-    region       = "us-east-1"
+    region       = "ap-south-1"
     encrypt      = true
     use_lockfile = true
   }
