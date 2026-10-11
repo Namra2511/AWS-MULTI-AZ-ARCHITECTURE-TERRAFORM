@@ -1,276 +1,93 @@
-# AWS Multi-AZ Infrastructure — Terraform
+# AWS Multi-AZ Infrastructure with Terraform
 
-Production-grade AWS infrastructure provisioned with Terraform. Deploys a highly available setup across 3 Availability Zones with an Application Load Balancer, Auto Scaling Group, and private EC2 instances running nginx. Remote state is stored in S3.
+Terraform example of a three-AZ AWS VPC with an internet-facing Application Load Balancer, EC2 Auto Scaling Group in private subnets, and nginx bootstrapped on Ubuntu. This is a **portfolio/reference deployment**, not a production certification.
 
-## Architecture
+![Architecture diagram](architecture.png)
 
-![AWS Architecture](architecture.png)
+## What it provisions
 
-| Component | Detail |
-|---|---|
-| **VPC** | `10.0.0.0/16` across 3 AZs |
-| **Subnets** | 3 public (ALB) + 3 private (EC2) |
-| **Load Balancer** | Internet-facing ALB, HTTP listener |
-| **EC2 Instances** | Ubuntu 22.04, private subnets, nginx |
-| **Auto Scaling** | CPU target tracking, min 1 → max 3 |
-| **NAT Gateway** | Single NAT GW in us-east-1a (cost saving) |
-| **Remote State** | S3 + native S3 lock file |
-| **Security** | IMDSv2, encrypted EBS, least-privilege SGs |
+| Area | Implementation |
+| --- | --- |
+| Network | VPC, three public and three private subnets across configured AZs, internet gateway |
+| Egress | **One NAT gateway** in the first AZ, shared by private subnets |
+| Ingress | Public Application Load Balancer with **HTTP port 80 only** |
+| Compute | Ubuntu 22.04 EC2 launch template, private ASG, nginx user data |
+| Scaling | CPU target tracking; default minimum 2, desired 3, maximum 6 |
+| Access | SSM instance profile; no inbound SSH security-group rule |
+| State | Existing S3 backend with native S3 lockfile |
+| Checks | GitHub Actions formatting and static validation |
 
----
+The single NAT gateway is an intentional cost/availability trade-off: an outage of its AZ can affect egress from all private subnets. HTTP is **unencrypted** and suitable only for non-sensitive demonstrations. For production, add TLS, certificates, appropriate logging/monitoring, and a resilient egress design.
 
 ## Prerequisites
 
-- [Terraform](https://developer.hashicorp.com/terraform/downloads) >= 1.10
-- [AWS CLI](https://aws.amazon.com/cli/) v2
-- AWS account with IAM permissions for EC2, VPC, ALB, ASG, IAM, S3
+- Terraform **1.10 or newer** (required for `use_lockfile`)
+- AWS CLI and credentials for an AWS account where you are authorized to create resources
+- An existing, private, versioned, encrypted S3 state bucket with appropriate state and lock-object permissions
+- Sufficient AWS budget for NAT, ALB, EC2, EBS and network traffic
 
----
+> **Important:** `providers.tf` currently references an existing S3 bucket named `namra-terraform-state` and key `production/terraform.tfstate`. This configuration may point to real state. Do **not** initialize against it unless you own it and intend to manage that infrastructure. Use a separate backend bucket/key for a new independent deployment.
 
-## 1. Configure AWS Credentials
+## Static checks (no AWS resources created)
 
 ```bash
-aws configure
+terraform fmt -check -recursive
+terraform init -backend=false -input=false
+terraform validate
 ```
 
-Enter your:
-- AWS Access Key ID
-- AWS Secret Access Key
-- Default region: `us-east-1`
-- Output format: `json`
+GitHub Actions runs the same checks on pull requests. A passing static check does not prove deployment success.
 
-Verify it works:
+## Configuration
+
+Copy `terraform.tfvars.example` to `terraform.tfvars` and review every value. The example file is tracked; the local `terraform.tfvars` file is ignored.
+
+By default `ami_id = ""` resolves the latest matching Canonical Ubuntu 22.04 LTS x86_64 image in the configured region. Pin a reviewed AMI ID for repeatable deployments. Default ASG sizes are **2 / 3 / 6** (minimum / desired / maximum).
+
+Availability Zones and subnet CIDR arrays must have matching lengths. Defaults target `us-east-1`; customize all region-specific settings together.
+
+## Plan and deploy (only after review)
+
 ```bash
 aws sts get-caller-identity
-```
-
----
-
-## 2. Set Up S3 Remote State Backend
-
-### Create the S3 bucket
-
-> Bucket names are globally unique — replace `your-name` with something unique.
-
-```powershell
-aws s3api create-bucket --bucket your-name-terraform-state --region us-east-1
-```
-
-### Enable versioning (lets you recover previous state)
-
-```powershell
-aws s3api put-bucket-versioning `
-  --bucket your-name-terraform-state `
-  --versioning-configuration Status=Enabled
-```
-
-### Enable server-side encryption
-
-```powershell
-aws s3api put-bucket-encryption `
-  --bucket your-name-terraform-state `
-  --server-side-encryption-configuration '{\"Rules\":[{\"ApplyServerSideEncryptionByDefault\":{\"SSEAlgorithm\":\"AES256\"}}]}'
-```
-
-### Block all public access
-
-```powershell
-aws s3api put-public-access-block `
-  --bucket your-name-terraform-state `
-  --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
-```
-
-### IAM permissions required
-
-The AWS user/role running Terraform needs these S3 permissions on the bucket:
-
-```json
-{
-  "Effect": "Allow",
-  "Action": [
-    "s3:GetObject",
-    "s3:PutObject",
-    "s3:DeleteObject",
-    "s3:ListBucket"
-  ],
-  "Resource": [
-    "arn:aws:s3:::your-name-terraform-state",
-    "arn:aws:s3:::your-name-terraform-state/*"
-  ]
-}
-```
-
-### Update providers.tf
-
-Edit the `backend "s3"` block in `providers.tf`:
-
-```hcl
-backend "s3" {
-  bucket       = "your-name-terraform-state"   # ← your bucket name
-  key          = "production/terraform.tfstate"
-  region       = "us-east-1"
-  encrypt      = true
-  use_lockfile = true
-}
-```
-
----
-
-## 3. Configure Variables
-
-Edit `terraform.tfvars`:
-
-```hcl
-aws_region   = "us-east-1"
-project_name = "myapp"
-environment  = "production"
-
-# Networking
-vpc_cidr             = "10.0.0.0/16"
-availability_zones   = ["us-east-1a", "us-east-1b", "us-east-1c"]
-public_subnet_cidrs  = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
-private_subnet_cidrs = ["10.0.11.0/24", "10.0.12.0/24", "10.0.13.0/24"]
-
-# Compute
-ami_id        = "ami-0261755bbcb8c4a84"  # Ubuntu 22.04 LTS (us-east-1)
-instance_type = "t3.micro"
-key_name      = ""  # Set to your EC2 Key Pair name for SSH
-
-# Auto Scaling
-asg_min_size           = 1
-asg_max_size           = 3
-asg_desired_capacity   = 1
-cpu_target_utilization = 60
-```
-
----
-
-## 4. Deploy
-
-```bash
-# Download providers and configure the S3 backend
 terraform init
-
-# Preview all resources that will be created (~26 resources)
 terraform plan
-
-# Deploy (type 'yes' when prompted — takes ~5 min)
+# Run only with explicit approval, correct state, and an understood cost estimate:
 terraform apply
 ```
 
-Get the ALB URL after apply:
-```bash
-terraform output alb_url
-```
-
-Open the URL in your browser — you should see the nginx welcome page.
-
----
-
-## 5. Verify Load Balancing
-
-**PowerShell:**
-```powershell
-$url = terraform output -raw alb_dns_name
-1..15 | % { (Invoke-RestMethod "http://$url/api/status") | Select-Object private_ip, instance_id, az }
-```
-
-**Bash / Git Bash:**
-```bash
-url=$(terraform output -raw alb_dns_name)
-for i in $(seq 1 15); do
-  curl -s "http://$url/api/status" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['private_ip'], d['instance_id'], d['az'])"
-done
-```
-
-Repeated calls should show different `private_ip` / `instance_id` values, confirming the ALB is distributing traffic.
-
----
-
-## 6. Test Autoscaling
-
-Connect to an instance via **AWS Systems Manager → Session Manager** and run:
+The ALB DNS name and URL are available through:
 
 ```bash
-stress-ng --cpu 0 --cpu-load 80 --timeout 600
+terraform output -raw alb_dns_name
+terraform output -raw alb_url
 ```
 
-After ~3 minutes of sustained CPU above 60%, the ASG will launch additional instances. Monitor in:
-- **EC2 → Auto Scaling Groups → Activity tab**
-- **EC2 → Target Groups → Targets tab**
+The nginx bootstrap serves the default page at `/`. The project does **not** currently install an `/api/status` endpoint, so do not use older endpoint-based examples as a test of load balancing. Validate the ALB target health and ASG instance membership in AWS before claiming distribution or failover was tested.
 
-Scaling back in happens automatically after ~15 minutes of low CPU.
+## Modules
 
----
-
-## 7. Verify Remote State
-
-After `terraform apply`, confirm state is stored in S3:
-
-```powershell
-aws s3 ls s3://your-name-terraform-state/production/
+```text
+.
+├── main.tf
+├── providers.tf
+├── variables.tf
+├── outputs.tf
+├── terraform.tfvars.example
+├── modules/
+│   ├── vpc/
+│   ├── security_groups/
+│   ├── alb/
+│   ├── ec2/
+│   └── autoscaling/
+├── docs/OPERATIONS.md
+└── .github/workflows/terraform-checks.yml
 ```
 
-Expected output:
-```
-terraform.tfstate
-```
+## Validation status and limitations
 
----
+This repository includes source review and static CI checks, but no evidence in this branch of a fresh live AWS deployment, AZ failure exercise, load test, or measured cost comparison. These results should be recorded only after testing. See [Operations and validation](docs/OPERATIONS.md) for acceptance checks, failure-domain caveats, backend precautions, and safe destruction guidance.
 
-## 8. Destroy
+## Cleanup
 
-```bash
-terraform destroy
-```
-
-> ⚠️ This deletes all resources including the NAT Gateway and Elastic IP. The S3 state bucket is **not** deleted — do that manually if needed.
-
----
-
-## Project Structure
-
-```
-terraform-aws-infra/
-├── main.tf               # Wires all modules together
-├── variables.tf          # Input variable definitions
-├── outputs.tf            # Output values and test commands
-├── providers.tf          # AWS provider + S3 backend config
-├── terraform.tfvars      # Your variable values (update before deploying)
-├── architecture.png      # Architecture diagram
-└── modules/
-    ├── vpc/              # VPC, subnets, IGW, NAT GW, route tables
-    ├── security_groups/  # SGs for ALB and EC2 instances
-    ├── alb/              # ALB, target group, HTTP listener
-    ├── ec2/              # IAM role, launch template, user data
-    └── autoscaling/      # ASG + CPU target tracking policy
-```
-
----
-
-## Variables Reference
-
-| Variable | Description | Default |
-|---|---|---|
-| `aws_region` | AWS region | `us-east-1` |
-| `project_name` | Resource name prefix | `myapp` |
-| `environment` | Environment label | `production` |
-| `vpc_cidr` | VPC CIDR block | `10.0.0.0/16` |
-| `ami_id` | EC2 AMI (Ubuntu 22.04) | us-east-1 AMI |
-| `instance_type` | EC2 instance type | `t3.micro` |
-| `key_name` | EC2 Key Pair for SSH | `""` (disabled) |
-| `asg_min_size` | ASG minimum instances | `1` |
-| `asg_max_size` | ASG maximum instances | `3` |
-| `asg_desired_capacity` | ASG desired instances | `1` |
-| `cpu_target_utilization` | CPU % to trigger scale-out | `60` |
-
----
-
-## Design Decisions
-
-- **Single NAT Gateway** — saves ~$64/month vs one per AZ. For production HA, set `count = length(var.availability_zones)` in `modules/vpc/main.tf`.
-- **ELB health check type on ASG** — ASG terminates instances the ALB marks unhealthy, not just OS failures.
-- **`depends_on = [module.vpc]`** on the autoscaling module — ensures the NAT Gateway is fully ready before the first instance launches, so user data runs successfully.
-- **IMDSv2 enforced** — prevents SSRF attacks from accessing instance metadata.
-- **EBS encryption** — all volumes encrypted at rest with AES256.
-- **S3 native locking (`use_lockfile`)** — replaces the older DynamoDB lock table approach, no extra infrastructure needed.
+`terraform destroy` can permanently remove infrastructure and must only be run after checking account, state and plan. The existing remote-state bucket is outside this configuration and is not deleted by Terraform.
